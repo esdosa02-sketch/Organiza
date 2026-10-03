@@ -1,13 +1,13 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import DateTimePicker from '@react-native-community/datetimepicker';
 import * as Calendar from 'expo-calendar';
+import { cancelAllScheduledNotificationsAsync } from 'expo-notifications/build/cancelAllScheduledNotificationsAsync';
 import { cancelScheduledNotificationAsync } from 'expo-notifications/build/cancelScheduledNotificationAsync';
 import { getPermissionsAsync, requestPermissionsAsync } from 'expo-notifications/build/NotificationPermissions';
 import { setNotificationHandler } from 'expo-notifications/build/NotificationsHandler';
 import { SchedulableTriggerInputTypes } from 'expo-notifications/build/Notifications.types';
 import { scheduleNotificationAsync } from 'expo-notifications/build/scheduleNotificationAsync';
 import { StatusBar } from 'expo-status-bar';
-import { type ReactNode, useEffect, useMemo, useState } from 'react';
+import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   BackHandler,
@@ -27,6 +27,15 @@ import {
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { applyActionEffects } from './src/actionEffects';
+import { exportTextFile, pickTextFile } from './src/backupFiles';
+import {
+  countData,
+  createBackup,
+  parseBackup,
+  type BackupParseResult,
+  type DataCounts,
+} from './src/dataSchema';
 import type {
   Action,
   AppData,
@@ -35,6 +44,13 @@ import type {
   Project,
   Status,
 } from './src/models';
+import { findDuplicatePhase, phaseKey, planPhaseEdit } from './src/phases';
+import {
+  createAutoBackup,
+  loadAppData,
+  loadLatestAutoBackup,
+  saveAppData,
+} from './src/storage';
 
 type Screen =
   | { name: 'home' }
@@ -49,7 +65,13 @@ type ActiveModal =
   | { type: 'status'; projectId: string; actionId: string }
   | { type: 'calendar'; projectId: string; mode: 'connect' | 'change' }
   | { type: 'contact'; contactId?: string }
+  | { type: 'backup' }
   | null;
+
+type LoadState =
+  | { status: 'loading' }
+  | { status: 'ready' }
+  | { status: 'error'; reason: string; damagedText?: string; damagedCopySaved: boolean };
 
 type QuickDate = {
   projectId: string;
@@ -76,7 +98,6 @@ type SummaryPhase = {
   color: string;
 };
 
-const STORAGE_KEY = '@organiza-app/personal-table-v2';
 const STATUS_COLORS = ['#F0A14A', '#5A9BD5', '#4BAF8A', '#A56ED8', '#E66F87'];
 const MONTHS = ['ene', 'feb', 'mar', 'abr', 'may', 'jun', 'jul', 'ago', 'sep', 'oct', 'nov', 'dic'];
 const REMINDER_OPTIONS: Array<{ label: string; minutes: number | null }> = [
@@ -116,43 +137,43 @@ function capitalizePhaseList(value: string) {
   return value.split(',').map(capitalizeFirst).join(',');
 }
 
-function orderLabelsWithCompletedLast(labels: string[], completedLabel: string) {
+function orderLabelsWithCompletedLast(allLabels: string[], completedLabel: string) {
+  // Repeated names are rejected on save; while typing, show each name once.
+  const labels = allLabels.filter(
+    (label, index) => allLabels.findIndex((other) => phaseKey(other) === phaseKey(label)) === index,
+  );
   const completed = labels.find((label) => label === completedLabel);
   return completed
     ? [...labels.filter((label) => label !== completed), completed]
     : labels;
 }
 
-function phaseKey(label: string) {
-  return label.trim().toLocaleLowerCase('es-MX');
-}
-
 function initialData(): AppData {
   return { projects: [], contacts: [] };
 }
 
-function normalizeData(saved: Partial<AppData> | null): AppData {
-  const projects = Array.isArray(saved?.projects) ? saved.projects : [];
-  const contacts = Array.isArray(saved?.contacts) ? saved.contacts : [];
+function countsLabel(counts: DataCounts) {
+  const plural = (count: number, one: string, many: string) =>
+    count + ' ' + (count === 1 ? one : many);
+  return (
+    plural(counts.projects, 'caso', 'casos') +
+    ', ' +
+    plural(counts.actions, 'acción', 'acciones') +
+    ' y ' +
+    plural(counts.contacts, 'contacto', 'contactos')
+  );
+}
 
-  return {
-    contacts: contacts.filter(
-      (contact): contact is Contact =>
-        Boolean(contact?.id && contact?.name && contact?.email),
-    ),
-    projects: projects.map((project) => ({
-      ...project,
-      actions: Array.isArray(project.actions)
-        ? project.actions.map((action) => ({
-            ...action,
-            inviteeIds: Array.isArray(action.inviteeIds) ? action.inviteeIds : [],
-            calendarInviteeEmails: Array.isArray(action.calendarInviteeEmails)
-              ? action.calendarInviteeEmails
-              : [],
-          }))
-        : [],
-    })),
-  };
+function backupFileName(date: Date) {
+  const padded = (value: number) => String(value).padStart(2, '0');
+  return (
+    'organiza-respaldo-' +
+    toDateKey(date) +
+    '-' +
+    padded(date.getHours()) +
+    padded(date.getMinutes()) +
+    '.json'
+  );
 }
 
 function newDefaultStatuses(): Status[] {
@@ -399,6 +420,21 @@ async function syncDeviceCalendarInvitees(
   action.calendarInviteeEmails = invitees.map((contact) => contact.email);
 }
 
+async function syncInviteesKeepingEvent(
+  event: Calendar.ExpoCalendarEvent,
+  action: Action,
+  contacts: Contact[],
+) {
+  try {
+    await syncDeviceCalendarInvitees(event, action, contacts);
+  } catch {
+    Alert.alert(
+      'Invitados sin actualizar',
+      'El evento quedó guardado en el calendario, pero no se pudieron actualizar sus invitados. Vuelve a guardar la acción para intentarlo otra vez.',
+    );
+  }
+}
+
 async function cancelReminder(notificationId?: string) {
   if (!notificationId || Platform.OS === 'web') {
     return;
@@ -410,7 +446,8 @@ async function cancelReminder(notificationId?: string) {
   }
 }
 
-async function scheduleReminder(action: Action, projectTitle: string) {
+/** With `quiet`, permission is not requested and problems are not shown one by one. */
+async function scheduleReminder(action: Action, projectTitle: string, quiet = false) {
   const reminderMinutes = reminderMinutesFor(action);
   if (reminderMinutes === undefined || !action.dueDate || Platform.OS === 'web') {
     return undefined;
@@ -426,15 +463,17 @@ async function scheduleReminder(action: Action, projectTitle: string) {
   try {
     const existingPermissions = await getPermissionsAsync();
     const permissions =
-      existingPermissions.status === 'granted'
+      existingPermissions.status === 'granted' || quiet
         ? existingPermissions
         : await requestPermissionsAsync();
 
     if (permissions.status !== 'granted') {
-      Alert.alert(
-        'Recordatorios desactivados',
-        'Puedes permitir las notificaciones desde los ajustes de tu teléfono cuando quieras.',
-      );
+      if (!quiet) {
+        Alert.alert(
+          'Recordatorios desactivados',
+          'Puedes permitir las notificaciones desde los ajustes de tu teléfono cuando quieras.',
+        );
+      }
       return undefined;
     }
 
@@ -449,10 +488,12 @@ async function scheduleReminder(action: Action, projectTitle: string) {
       },
     });
   } catch {
-    Alert.alert(
-      'No se programó el recordatorio',
-      'Revisa que las notificaciones estén permitidas para Organiza.',
-    );
+    if (!quiet) {
+      Alert.alert(
+        'No se programó el recordatorio',
+        'Revisa que las notificaciones estén permitidas para Organiza.',
+      );
+    }
     return undefined;
   }
 }
@@ -485,22 +526,26 @@ async function syncDeviceCalendarEvent(project: Project, action: Action, contact
   const details = calendarEventDetails(project, action);
   try {
     if (action.calendarEventId) {
+      let existing: Calendar.ExpoCalendarEvent | undefined;
       try {
-        const existing = await Calendar.ExpoCalendarEvent.get(action.calendarEventId);
+        existing = await Calendar.ExpoCalendarEvent.get(action.calendarEventId);
+      } catch {
+        // If the event was removed manually, create it again in the selected calendar.
+      }
+      if (existing) {
         await existing.update(details);
-        await syncDeviceCalendarInvitees(existing, action, contacts);
+        await syncInviteesKeepingEvent(existing, action, contacts);
         return {
           id: action.calendarEventId,
           calendarId: action.calendarEventCalendarId || project.calendarId,
         };
-      } catch {
-        // If the event was removed manually, create it again in the selected calendar.
       }
     }
 
     const calendar = await Calendar.ExpoCalendar.get(project.calendarId);
     const event = await calendar.createEvent(details);
-    await syncDeviceCalendarInvitees(event, action, contacts);
+    // The event exists from here on, so its id is kept even if invitees fail.
+    await syncInviteesKeepingEvent(event, action, contacts);
     return {
       id: event.id,
       calendarId: project.calendarId,
@@ -539,7 +584,13 @@ function OrganizaApp() {
     [height, width],
   );
   const [data, setData] = useState<AppData>(initialData);
-  const [ready, setReady] = useState(false);
+  const [loadState, setLoadState] = useState<LoadState>({ status: 'loading' });
+  const [saveFailed, setSaveFailed] = useState(false);
+  const [backupBusy, setBackupBusy] = useState(false);
+  const [latestAutoBackupAt, setLatestAutoBackupAt] = useState<string | null>(null);
+  const saveAttempt = useRef(0);
+  const backupTaskRunning = useRef(false);
+  const ready = loadState.status === 'ready';
   const [screen, setScreen] = useState<Screen>({ name: 'home' });
   const [modal, setModal] = useState<ActiveModal>(null);
   const [quickDate, setQuickDate] = useState<QuickDate | null>(null);
@@ -569,28 +620,63 @@ function OrganizaApp() {
   const [contactName, setContactName] = useState('');
   const [contactEmail, setContactEmail] = useState('');
 
-  useEffect(() => {
-    async function load() {
-      try {
-        const saved = await AsyncStorage.getItem(STORAGE_KEY);
-        if (saved) {
-          setData(normalizeData(JSON.parse(saved) as Partial<AppData>));
-        }
-      } catch {
-        Alert.alert('No fue posible recuperar tus casos guardados');
-      } finally {
-        setReady(true);
-      }
+  async function loadStoredData() {
+    setLoadState({ status: 'loading' });
+    const outcome = await loadAppData();
+    if (outcome.status === 'error') {
+      // Nothing is saved while the data cannot be read, so it is never overwritten.
+      setLoadState(outcome);
+      return;
     }
+    setData(outcome.data);
+    setLoadState({ status: 'ready' });
+    if (outcome.repairs.length) {
+      Alert.alert(
+        'Revisamos tus datos guardados',
+        'Organiza completó algunos detalles que faltaban:\n\n• ' +
+          outcome.repairs.slice(0, 4).join('\n• ') +
+          (outcome.repairs.length > 4 ? '\n• y ' + (outcome.repairs.length - 4) + ' más.' : ''),
+      );
+    }
+  }
 
-    void load();
+  useEffect(() => {
+    void loadStoredData();
   }, []);
+
+  /** Resolves to false when the phone could not save; the latest attempt decides the warning. */
+  function persist(next: AppData) {
+    const attempt = ++saveAttempt.current;
+    return saveAppData(next).then(
+      () => {
+        if (attempt === saveAttempt.current) {
+          setSaveFailed(false);
+        }
+        return true;
+      },
+      () => {
+        if (attempt === saveAttempt.current) {
+          setSaveFailed(true);
+        }
+        return false;
+      },
+    );
+  }
 
   useEffect(() => {
     if (ready) {
-      void AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+      void persist(data);
     }
   }, [data, ready]);
+
+  useEffect(() => {
+    if (saveFailed) {
+      Alert.alert(
+        'No se pudo guardar',
+        'Tu último cambio no quedó guardado en este teléfono. Revisa que tenga espacio libre y toca «Reintentar» en el aviso rojo. Si cierras la app ahora, ese cambio podría perderse.',
+      );
+    }
+  }, [saveFailed]);
 
   useEffect(() => {
     if (Platform.OS === 'web') {
@@ -879,6 +965,11 @@ function OrganizaApp() {
       Alert.alert('Agrega al menos dos fases separadas por comas');
       return;
     }
+    const duplicatePhase = findDuplicatePhase(labels);
+    if (duplicatePhase) {
+      Alert.alert('Cada fase debe tener un nombre distinto', '«' + duplicatePhase + '» está repetida.');
+      return;
+    }
     if (projectCalendarEnabled && !projectCalendarChoice) {
       Alert.alert('Elige un calendario antes de crear el caso');
       return;
@@ -926,7 +1017,6 @@ function OrganizaApp() {
       .split(',')
       .map((item) => capitalizeFirst(item.trim()))
       .filter(Boolean);
-    const keys = labels.map(phaseKey);
 
     if (!title) {
       Alert.alert('Escribe el nombre del caso');
@@ -936,56 +1026,75 @@ function OrganizaApp() {
       Alert.alert('Agrega al menos dos fases separadas por comas');
       return;
     }
-    if (new Set(keys).size !== keys.length) {
-      Alert.alert('Cada fase debe tener un nombre distinto');
+    const duplicatePhase = findDuplicatePhase(labels);
+    if (duplicatePhase) {
+      Alert.alert('Cada fase debe tener un nombre distinto', '«' + duplicatePhase + '» está repetida.');
       return;
     }
 
-    const currentStatuses = orderedStatuses(project);
-    const newKeys = new Set(keys);
-    const unmatchedOldStatuses = currentStatuses.filter(
-      (status) => !newKeys.has(phaseKey(status.label)),
-    );
-    const statusesBeforeOrdering = labels.map((label, index) => {
-      const matchingStatus = currentStatuses.find(
-        (status) => phaseKey(status.label) === phaseKey(label),
-      );
-      const reusableStatus = matchingStatus || unmatchedOldStatuses.shift();
-      return reusableStatus
-        ? { ...reusableStatus, label, color: reusableStatus.color || STATUS_COLORS[index % STATUS_COLORS.length] }
-        : { id: uid('status'), label, color: STATUS_COLORS[index % STATUS_COLORS.length] };
+    const taskCounts = project.actions.reduce<Record<string, number>>((counts, action) => {
+      counts[action.statusId] = (counts[action.statusId] || 0) + 1;
+      return counts;
+    }, {});
+    const plan = planPhaseEdit({
+      current: orderedStatuses(project),
+      labels,
+      completedLabel: completedStatusLabel,
+      taskCounts,
+      newId: () => uid('status'),
+      colors: STATUS_COLORS,
     });
-    const completed =
-      statusesBeforeOrdering.find((status) => status.label === completedStatusLabel) ||
-      statusesBeforeOrdering[statusesBeforeOrdering.length - 1];
-    const statuses = [
-      ...statusesBeforeOrdering.filter((status) => status.id !== completed.id),
-      completed,
-    ];
-    const statusIds = new Set(statuses.map((status) => status.id));
-    const fallbackStatus = statuses.find((status) => status.id !== completed.id) || statuses[0];
-    const now = new Date().toISOString();
 
-    setData((current) => ({
-      ...current,
-      projects: current.projects.map((item) =>
-        item.id !== projectId
-          ? item
-          : {
-              ...item,
-              title,
-              description,
-              statuses,
-              completedStatusId: completed.id,
-              actions: item.actions.map((action) =>
-                statusIds.has(action.statusId)
-                  ? action
-                  : { ...action, statusId: fallbackStatus.id, updatedAt: now },
-              ),
-            },
-      ),
-    }));
-    setModal(null);
+    const applyPlan = (treatAsRenames: boolean) => {
+      const { statuses, completedStatusId, fallbackStatusId } = plan.apply(treatAsRenames);
+      const statusIds = new Set(statuses.map((status) => status.id));
+      const now = new Date().toISOString();
+
+      setData((current) => ({
+        ...current,
+        projects: current.projects.map((item) =>
+          item.id !== projectId
+            ? item
+            : {
+                ...item,
+                title,
+                description,
+                statuses,
+                completedStatusId,
+                actions: item.actions.map((action) =>
+                  statusIds.has(action.statusId)
+                    ? action
+                    : { ...action, statusId: fallbackStatusId, updatedAt: now },
+                ),
+              },
+        ),
+      }));
+      setModal(null);
+    };
+
+    if (!plan.ambiguousRenames.length) {
+      applyPlan(false);
+      return;
+    }
+
+    // Writing a new name where an old one was can mean a rename or a replacement.
+    const changes = plan.ambiguousRenames
+      .map(
+        ({ from, to, taskCount }) =>
+          '«' + from.label + '» → «' + to + '» (' +
+          (taskCount === 1 ? '1 acción' : taskCount + ' acciones') + ')',
+      )
+      .join('\n');
+    Alert.alert(
+      '¿Cambiaste el nombre de una fase?',
+      changes +
+        '\n\nSi solo cambiaste el nombre, sus acciones conservan su lugar. Si es una fase nueva, las acciones de la fase quitada pasan a la primera fase que se conserva.',
+      [
+        { text: 'Cancelar', style: 'cancel' },
+        { text: 'Es una fase nueva', onPress: () => applyPlan(false) },
+        { text: 'Sí, cambié el nombre', onPress: () => applyPlan(true) },
+      ],
+    );
   }
 
   function openActionSheet(projectId: string, actionId?: string) {
@@ -1005,6 +1114,25 @@ function OrganizaApp() {
     setShowActionDatePicker(false);
     setShowActionTimePicker(false);
     setModal({ type: 'action', projectId, actionId });
+  }
+
+  function actionEffectDeps(project: Project) {
+    return {
+      syncCalendar: async (action: Action) => {
+        try {
+          return await syncCalendarEvent(project, action, data.contacts);
+        } catch (error) {
+          Alert.alert(
+            'No se pudo agendar',
+            'La acción se guardó, pero su evento de calendario no se actualizó.',
+          );
+          throw error;
+        }
+      },
+      removeCalendar: removeManagedCalendarEvent,
+      scheduleReminder: (action: Action) => scheduleReminder(action, project.title),
+      cancelReminder,
+    };
   }
 
   async function saveAction(projectId: string, actionId?: string) {
@@ -1032,8 +1160,7 @@ function OrganizaApp() {
       return;
     }
 
-    await cancelReminder(previousAction?.notificationId);
-    const action: Action = {
+    const draft: Action = {
       id: actionId || uid('action'),
       title: capitalizeFirst(actionTitle.trim()),
       dueDate: actionDate ? toDateKey(actionDate) : undefined,
@@ -1050,27 +1177,16 @@ function OrganizaApp() {
       calendarInviteeEmails: previousAction?.calendarInviteeEmails,
       updatedAt: new Date().toISOString(),
     };
-    action.notificationId = await scheduleReminder(action, project.title);
-    if (!action.dueDate && previousAction?.calendarEventId) {
-      try {
-        await removeManagedCalendarEvent(previousAction);
-      } catch (error) {
-        Alert.alert(
-          'No se quitó el evento de Calendar',
-          error instanceof Error
-            ? error.message
-            : 'Comprueba que el calendario siga disponible antes de quitar la fecha.',
-        );
-        return;
-      }
-      action.calendarEventId = undefined;
-      action.calendarEventCalendarId = undefined;
-      action.calendarInviteeEmails = [];
-    } else {
-      const synced = await syncCalendarEvent(project, action, data.contacts);
-      action.calendarEventId = synced.id;
-      action.calendarEventCalendarId = synced.calendarId;
+    const result = await applyActionEffects(
+      previousAction,
+      draft,
+      actionEffectDeps(project),
+    );
+    if (!result.ok) {
+      Alert.alert('No se quitó el evento de Calendar', result.message);
+      return;
     }
+    const action = result.action;
 
     setData((current) => ({
       ...current,
@@ -1094,16 +1210,16 @@ function OrganizaApp() {
       return;
     }
 
-    await cancelReminder(existing.notificationId);
-    const updated: Action = {
-      ...existing,
-      dueDate: toDateKey(date),
-      updatedAt: new Date().toISOString(),
-    };
-    updated.notificationId = await scheduleReminder(updated, project.title);
-    const synced = await syncCalendarEvent(project, updated, data.contacts);
-    updated.calendarEventId = synced.id;
-    updated.calendarEventCalendarId = synced.calendarId;
+    const result = await applyActionEffects(
+      existing,
+      { ...existing, dueDate: toDateKey(date), updatedAt: new Date().toISOString() },
+      actionEffectDeps(project),
+    );
+    if (!result.ok) {
+      Alert.alert('No se cambió la fecha', result.message);
+      return;
+    }
+    const updated = result.action;
 
     setData((current) => ({
       ...current,
@@ -1400,6 +1516,262 @@ function OrganizaApp() {
     }));
   }
 
+  function openBackupSheet() {
+    setLatestAutoBackupAt(null);
+    setModal({ type: 'backup' });
+    loadLatestAutoBackup()
+      .then((latest) => setLatestAutoBackupAt(latest?.ok ? latest.exportedAt : null))
+      .catch(() => setLatestAutoBackupAt(null));
+  }
+
+  async function runBackupTask(task: () => Promise<void>) {
+    if (backupTaskRunning.current) {
+      return;
+    }
+    backupTaskRunning.current = true;
+    setBackupBusy(true);
+    try {
+      await task();
+    } finally {
+      backupTaskRunning.current = false;
+      setBackupBusy(false);
+    }
+  }
+
+  async function exportFile(fileName: string, contents: string, savedMessage: string) {
+    try {
+      const outcome = await exportTextFile(fileName, contents);
+      if (outcome === 'saved') {
+        Alert.alert('Archivo guardado', savedMessage);
+      } else if (outcome === 'shared') {
+        Alert.alert(
+          'Archivo listo',
+          'Si elegiste «Guardar en Archivos» o lo enviaste a otro lugar, ahí quedó la copia. ' + savedMessage,
+        );
+      }
+    } catch (error) {
+      Alert.alert(
+        'No se pudo guardar el archivo',
+        error instanceof Error && error.message
+          ? error.message
+          : 'Inténtalo otra vez eligiendo otra carpeta.',
+      );
+    }
+  }
+
+  function exportBackup() {
+    void runBackupTask(async () => {
+      const now = new Date();
+      const fileName = backupFileName(now);
+      await exportFile(
+        fileName,
+        JSON.stringify(createBackup(data, now), null, 2),
+        '«' + fileName + '» contiene ' + countsLabel(countData(data)) +
+          '. Guárdalo en un lugar seguro: incluye la información de tus casos sin cifrar.',
+      );
+    });
+  }
+
+  function exportDamagedData() {
+    if (loadState.status !== 'error' || !loadState.damagedText) {
+      return;
+    }
+    const text = loadState.damagedText;
+    void runBackupTask(() =>
+      exportFile(
+        'organiza-datos-danados-' + toDateKey(new Date()) + '.json',
+        text,
+        'Conserva este archivo; con él se puede intentar recuperar tu información.',
+      ),
+    );
+  }
+
+  function restoreFromFile() {
+    void runBackupTask(async () => {
+      let picked: Awaited<ReturnType<typeof pickTextFile>>;
+      try {
+        picked = await pickTextFile();
+      } catch (error) {
+        Alert.alert(
+          'No se pudo abrir el archivo',
+          error instanceof Error && error.message ? error.message : 'Inténtalo otra vez.',
+        );
+        return;
+      }
+      if (!picked.canceled) {
+        confirmRestore(parseBackup(picked.text));
+      }
+    });
+  }
+
+  function restoreLatestAutoBackup() {
+    void runBackupTask(async () => {
+      try {
+        const latest = await loadLatestAutoBackup();
+        if (!latest) {
+          Alert.alert('No hay copias automáticas en este teléfono');
+          return;
+        }
+        confirmRestore(latest);
+      } catch {
+        Alert.alert('No se pudo leer la copia automática', 'Tus datos actuales no se modificaron.');
+      }
+    });
+  }
+
+  function confirmRestore(backup: BackupParseResult) {
+    if (!backup.ok) {
+      Alert.alert(
+        'No se puede restaurar este archivo',
+        backup.reason + ' Tus datos actuales no se modificaron.',
+      );
+      return;
+    }
+    const replacing = ready
+      ? 'Reemplazará lo que tienes ahora (' +
+        countsLabel(countData(data)) +
+        '). Antes se guardará una copia automática en este teléfono.'
+      : 'Reemplazará los datos que no se pudieron leer.';
+    Alert.alert(
+      '¿Restaurar este respaldo?',
+      'Respaldo del ' + formatUpdated(backup.exportedAt) + ' con ' + countsLabel(backup.counts) + '.\n\n' +
+        replacing +
+        '\n\nLos eventos de Google Calendar y los recordatorios pertenecen a cada teléfono. Si lo restauras en otro celular, vuelve a conectar el calendario de cada caso.',
+      [
+        { text: 'Cancelar', style: 'cancel' },
+        {
+          text: 'Restaurar',
+          style: 'destructive',
+          onPress: () => void runBackupTask(() => restoreData(backup.data)),
+        },
+      ],
+    );
+  }
+
+  async function restoreData(restored: AppData) {
+    if (ready) {
+      try {
+        await createAutoBackup(data);
+      } catch {
+        Alert.alert(
+          'No se restauró el respaldo',
+          'No se pudo crear la copia automática de tus datos actuales, así que no se reemplazó nada.',
+        );
+        return;
+      }
+    }
+
+    // Reminder ids only exist on the phone that created them.
+    const withoutReminderIds: AppData = {
+      ...restored,
+      projects: restored.projects.map((project) => ({
+        ...project,
+        actions: project.actions.map((action) => ({ ...action, notificationId: undefined })),
+      })),
+    };
+    try {
+      await saveAppData(withoutReminderIds);
+    } catch {
+      Alert.alert(
+        'No se restauró el respaldo',
+        'El teléfono no pudo guardar los datos del respaldo. Tus datos actuales siguen igual.',
+      );
+      return;
+    }
+
+    try {
+      // Organiza only schedules reminders, so this clears the ones of the replaced data.
+      await cancelAllScheduledNotificationsAsync();
+    } catch {
+      // Nothing scheduled, or notifications are not available on this platform.
+    }
+    const rescheduled = await rescheduleReminders(withoutReminderIds);
+
+    setData(rescheduled.data);
+    setLoadState({ status: 'ready' });
+    setScreen({ name: 'home' });
+    setModal(null);
+
+    const usesCalendar = rescheduled.data.projects.some((project) => project.useGoogleCalendar);
+    Alert.alert(
+      'Respaldo restaurado',
+      'Ahora tienes ' + countsLabel(countData(rescheduled.data)) + '.' +
+        (rescheduled.scheduled
+          ? '\n\nSe volvieron a programar ' + rescheduled.scheduled + ' recordatorios futuros.'
+          : '') +
+        (rescheduled.permissionMissing
+          ? '\n\nPermite las notificaciones de Organiza para volver a activar los recordatorios.'
+          : '') +
+        (usesCalendar
+          ? '\n\nSi este no es el teléfono donde hiciste el respaldo, abre cada caso con calendario y elígelo de nuevo.'
+          : ''),
+    );
+  }
+
+  async function rescheduleReminders(source: AppData) {
+    const wanted = source.projects.some((project) =>
+      project.actions.some((action) => reminderMinutesFor(action) !== undefined && action.dueDate),
+    );
+    if (!wanted || Platform.OS === 'web') {
+      return { data: source, scheduled: 0, permissionMissing: false };
+    }
+
+    let granted = false;
+    try {
+      const existing = await getPermissionsAsync();
+      granted =
+        existing.status === 'granted' || (await requestPermissionsAsync()).status === 'granted';
+    } catch {
+      granted = false;
+    }
+    if (!granted) {
+      return { data: source, scheduled: 0, permissionMissing: true };
+    }
+
+    let scheduled = 0;
+    const projects: Project[] = [];
+    for (const project of source.projects) {
+      const actions: Action[] = [];
+      for (const action of project.actions) {
+        const notificationId = await scheduleReminder(action, project.title, true);
+        if (notificationId) {
+          scheduled += 1;
+        }
+        actions.push({ ...action, notificationId });
+      }
+      projects.push({ ...project, actions });
+    }
+    return { data: { ...source, projects }, scheduled, permissionMissing: false };
+  }
+
+  function startOverAfterDamage() {
+    if (loadState.status !== 'error') {
+      return;
+    }
+    if (!loadState.damagedCopySaved) {
+      Alert.alert(
+        'Primero guarda una copia',
+        'No se pudo apartar una copia de los datos dañados en el teléfono. Usa «Guardar copia de los datos» o restaura un respaldo para no perderlos.',
+      );
+      return;
+    }
+    Alert.alert(
+      '¿Empezar sin tus datos anteriores?',
+      'Organiza empezará vacía. Los datos que no se pudieron leer quedan apartados en este teléfono, pero no los verás en la app.',
+      [
+        { text: 'Cancelar', style: 'cancel' },
+        {
+          text: 'Empezar de nuevo',
+          style: 'destructive',
+          onPress: () => {
+            setData(initialData());
+            setLoadState({ status: 'ready' });
+          },
+        },
+      ],
+    );
+  }
+
   function renderMainScreen() {
     if (screen.name === 'contacts') {
       return (
@@ -1459,6 +1831,7 @@ function OrganizaApp() {
         onOpenProject={(projectId) => setScreen({ name: 'project', projectId })}
         onOpenContacts={() => setScreen({ name: 'contacts' })}
         onOpenSummary={() => setScreen({ name: 'summary' })}
+        onOpenBackup={openBackupSheet}
       />
     );
   }
@@ -1595,7 +1968,7 @@ function OrganizaApp() {
           />
           <Field
             label="Fases del caso"
-            helper="Sepáralas con comas. Si eliminas una fase, sus acciones pasan a la primera fase."
+            helper="Sepáralas con comas. Si eliminas una fase, sus acciones pasan a la primera fase que se conserve."
             value={projectStatusText}
             onChangeText={updateProjectStatusText}
           />
@@ -1693,6 +2066,51 @@ function OrganizaApp() {
             onAddAccount={() => void addGoogleAccountToPhone()}
             onRefresh={() => void loadGoogleCalendarChoices()}
           />
+        </BottomSheet>
+      );
+    }
+
+    if (modal.type === 'backup') {
+      return (
+        <BottomSheet title="Respaldo de tus datos" onClose={() => setModal(null)}>
+          <Text style={styles.sheetDescription}>
+            Guarda en un archivo tus casos, acciones, fases y contactos para recuperarlos si cambias o
+            pierdes el teléfono. Ahora tienes {countsLabel(countData(data))}.
+          </Text>
+          <PrimaryButton
+            label={backupBusy ? 'Un momento…' : 'Exportar respaldo'}
+            onPress={exportBackup}
+          />
+          <Pressable
+            style={[styles.backupOption, backupBusy && styles.calendarToolDisabled]}
+            onPress={restoreFromFile}
+            disabled={backupBusy}
+          >
+            <Text style={styles.backupOptionTitle}>Restaurar respaldo</Text>
+            <Text style={styles.backupOptionText}>
+              Elige un archivo exportado desde Organiza. Antes de reemplazar algo te pediremos confirmarlo.
+            </Text>
+          </Pressable>
+          {latestAutoBackupAt ? (
+            <Pressable
+              style={[styles.backupOption, backupBusy && styles.calendarToolDisabled]}
+              onPress={restoreLatestAutoBackup}
+              disabled={backupBusy}
+            >
+              <Text style={styles.backupOptionTitle}>Recuperar copia automática</Text>
+              <Text style={styles.backupOptionText}>
+                Organiza la guardó en este teléfono antes de la última restauración (
+                {formatUpdated(latestAutoBackupAt)}).
+              </Text>
+            </Pressable>
+          ) : null}
+          <View style={styles.contactsHint}>
+            <Text style={styles.contactsHintText}>
+              Los eventos de Google Calendar y los recordatorios pertenecen a cada teléfono. Si restauras en
+              otro celular, vuelve a conectar el calendario de cada caso. El archivo no incluye contraseñas
+              ni claves, pero sí la información de tus casos sin cifrar: guárdalo en un lugar seguro.
+            </Text>
+          </View>
         </BottomSheet>
       );
     }
@@ -1982,7 +2400,7 @@ function OrganizaApp() {
     );
   }
 
-  if (!ready) {
+  if (loadState.status === 'loading') {
     return (
       <SafeAreaView style={styles.safeArea} edges={['top', 'bottom']}>
         <View style={styles.loading}>
@@ -1993,9 +2411,70 @@ function OrganizaApp() {
     );
   }
 
+  if (loadState.status === 'error') {
+    return (
+      <SafeAreaView style={styles.safeArea} edges={['top', 'bottom']}>
+        <StatusBar style="dark" />
+        <ScrollView contentContainerStyle={[styles.loadError, { paddingHorizontal: mobileLayout.edge }]}>
+          <Text style={styles.loadingMark}>▦</Text>
+          <Text style={styles.loadErrorTitle}>No pudimos abrir tus casos</Text>
+          <Text style={styles.loadErrorText}>{loadState.reason}</Text>
+          <Text style={styles.loadErrorText}>
+            Organiza no guardará nada encima de esos datos. Puedes reintentar, restaurar un respaldo o guardar
+            una copia de los datos para intentar recuperarlos.
+          </Text>
+          <PrimaryButton label="Reintentar" onPress={() => void loadStoredData()} />
+          <Pressable
+            style={[styles.backupOption, backupBusy && styles.calendarToolDisabled]}
+            onPress={restoreFromFile}
+            disabled={backupBusy}
+          >
+            <Text style={styles.backupOptionTitle}>Restaurar respaldo</Text>
+            <Text style={styles.backupOptionText}>Elige un archivo exportado desde Organiza.</Text>
+          </Pressable>
+          {loadState.damagedText ? (
+            <Pressable
+              style={[styles.backupOption, backupBusy && styles.calendarToolDisabled]}
+              onPress={exportDamagedData}
+              disabled={backupBusy}
+            >
+              <Text style={styles.backupOptionTitle}>Guardar copia de los datos</Text>
+              <Text style={styles.backupOptionText}>
+                Guarda tal cual lo que estaba en el teléfono para intentar recuperarlo después.
+              </Text>
+            </Pressable>
+          ) : null}
+          {loadState.damagedText ? (
+            <Pressable style={styles.deleteButton} onPress={startOverAfterDamage}>
+              <Text style={styles.deleteButtonText}>Empezar de nuevo</Text>
+            </Pressable>
+          ) : null}
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
   return (
     <SafeAreaView style={styles.safeArea} edges={['top', 'bottom']}>
       <StatusBar style="dark" />
+      {saveFailed ? (
+        <View style={styles.saveErrorBanner}>
+          <Text style={styles.saveErrorText}>No se pudo guardar tu último cambio en este teléfono.</Text>
+          <Pressable
+            style={styles.saveErrorButton}
+            onPress={() =>
+              void persist(data).then((saved) => {
+                if (!saved) {
+                  Alert.alert('Todavía no se pudo guardar', 'Libera espacio en el teléfono e inténtalo otra vez.');
+                }
+              })
+            }
+            accessibilityRole="button"
+          >
+            <Text style={styles.saveErrorButtonText}>Reintentar</Text>
+          </Pressable>
+        </View>
+      ) : null}
       {renderMainScreen()}
       {renderModal()}
       {renderQuickDate()}
@@ -2018,6 +2497,7 @@ function HomeScreen({
   onOpenProject,
   onOpenContacts,
   onOpenSummary,
+  onOpenBackup,
 }: {
   projects: ProjectListItem[];
   layout: MobileLayout;
@@ -2025,6 +2505,7 @@ function HomeScreen({
   onOpenProject: (projectId: string) => void;
   onOpenContacts: () => void;
   onOpenSummary: () => void;
+  onOpenBackup: () => void;
 }) {
   return (
     <ScrollView
@@ -2058,6 +2539,14 @@ function HomeScreen({
         <Text style={styles.sectionCount}>{projects.length}</Text>
         <Pressable style={styles.contactsShortcut} onPress={onOpenContacts}>
           <Text style={styles.contactsShortcutText}>Contactos</Text>
+        </Pressable>
+        <Pressable
+          style={[styles.contactsShortcut, styles.backupShortcut]}
+          onPress={onOpenBackup}
+          accessibilityRole="button"
+          accessibilityLabel="Respaldo de tus datos"
+        >
+          <Text style={styles.contactsShortcutText}>Respaldo</Text>
         </Pressable>
       </View>
 
@@ -3479,6 +3968,9 @@ const styles = StyleSheet.create({
     fontSize: 11,
     fontWeight: '800',
   },
+  backupShortcut: {
+    marginLeft: 0,
+  },
   projectCard: {
     backgroundColor: '#FFFFFF',
     borderRadius: 17,
@@ -4274,6 +4766,70 @@ const styles = StyleSheet.create({
   },
   calendarToolDisabled: {
     opacity: 0.55,
+  },
+  backupOption: {
+    borderRadius: 13,
+    backgroundColor: '#F0F7FA',
+    paddingHorizontal: 14,
+    paddingVertical: 11,
+    marginTop: 10,
+  },
+  backupOptionTitle: {
+    color: '#28647D',
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  backupOptionText: {
+    color: '#607C8B',
+    fontSize: 11,
+    lineHeight: 16,
+    marginTop: 3,
+  },
+  loadError: {
+    flexGrow: 1,
+    justifyContent: 'center',
+    paddingVertical: 28,
+  },
+  loadErrorTitle: {
+    color: '#14364B',
+    fontSize: 22,
+    fontWeight: '800',
+    marginTop: 8,
+    marginBottom: 8,
+  },
+  loadErrorText: {
+    color: '#52606B',
+    fontSize: 13,
+    lineHeight: 19,
+    marginBottom: 12,
+  },
+  saveErrorBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    backgroundColor: '#FBE7EA',
+    borderBottomWidth: 1,
+    borderBottomColor: '#F1C3CB',
+    paddingHorizontal: 16,
+    paddingVertical: 9,
+  },
+  saveErrorText: {
+    flex: 1,
+    color: '#9D3446',
+    fontSize: 12,
+    lineHeight: 17,
+    fontWeight: '700',
+  },
+  saveErrorButton: {
+    borderRadius: 10,
+    backgroundColor: '#C65767',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  saveErrorButtonText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '800',
   },
   calendarOption: {
     minHeight: 62,
