@@ -1,0 +1,41 @@
+{
+  "expo": {
+    "name": "Organiza",
+    "slug": "organiza-proyectos",
+    "version": "1.2.4",
+    "orientation": "portrait",
+    "scheme": "organiza",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.xime.organiza",
+      "buildNumber": "6"
+    },
+    "android": {
+      "package": "com.xime.organiza",
+      "versionCode": 6,
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-notifications",
+      "@react-native-community/datetimepicker",
+      [
+        "expo-calendar",
+        {
+          "calendarPermission": "Permite que Organiza acceda a tus calendarios para agendar acciones."
+        }
+      ],
+      "expo-status-bar"
+    ]
+  }
+}
